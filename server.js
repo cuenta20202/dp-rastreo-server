@@ -1,280 +1,173 @@
 /**
  * dp-rastreo-server — DistritoPhone.
- * Servidor Express que hace scraping de las páginas de rastreo
- * de mensajerías colombianas y devuelve el estado en JSON.
- *
- * Deploy en Render.com (free tier):
- *   - Build command: npm install
- *   - Start command: node server.js
+ * Usa la API de AfterShip para rastrear guías de cualquier mensajería.
+ * La API Key se lee de la variable de entorno AFTERSHIP_API_KEY (Render).
  */
 
 const express = require('express');
 const cors    = require('cors');
 const fetch   = require('node-fetch');
-const cheerio = require('cheerio');
 
 const app  = express();
 const PORT = process.env.PORT || 10000;
+const AFTERSHIP_KEY = process.env.AFTERSHIP_API_KEY;
 
-/* ── CORS: permite llamadas desde GitHub Pages y localhost ── */
-const ALLOWED_ORIGINS = [
-  'https://cuenta2020.github.io',
-  'http://localhost',
-  'http://127.0.0.1',
-  'null' /* file:// en celular */
-];
-app.use(cors({
-  origin: function (origin, cb) {
-    if (!origin || ALLOWED_ORIGINS.some(o => origin.startsWith(o))) return cb(null, true);
-    cb(null, true); /* abierto por ahora — restringir en producción si se necesita */
-  }
-}));
+app.use(cors());
 app.use(express.json());
 
-/* ── Headers de seguridad ── */
-app.use((req, res, next) => {
-  res.setHeader('X-Content-Type-Options', 'nosniff');
-  next();
-});
-
-/* ══════════════════════════════════════════════
-   HELPERS
-══════════════════════════════════════════════ */
-
-/** Timeout para fetch */
-const fetchWithTimeout = (url, options = {}, ms = 12000) => {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), ms);
-  return fetch(url, { ...options, signal: controller.signal })
-    .finally(() => clearTimeout(timer));
+/* ── Mapa: ID interno → slug de AfterShip ── */
+const CARRIER_SLUGS = {
+  coordinadora:    'coordinadora',
+  servientrega:    'servientrega',
+  envia:           'envia-colombia',
+  tcc:             'tcc-colombia',
+  interrapidisimo: 'interrapidisimo',
+  deprisa:         'deprisa',
+  fedex:           'fedex',
+  dhl:             'dhl'
 };
 
-const HEADERS_BROWSER = {
-  'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
-  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-  'Accept-Language': 'es-CO,es;q=0.9',
-  'Accept-Encoding': 'gzip, deflate, br',
-  'Connection': 'keep-alive'
+/* ── Mapa: ID interno → URL de fallback ── */
+const FALLBACK_URLS = {
+  coordinadora:    'https://www.coordinadora.com/portafolio-de-servicios/servicios-en-linea/rastrear-guias/?guia=',
+  servientrega:    'https://www.servientrega.com/wps/portal/tracking-masivo?id=',
+  envia:           'https://www.envia.co/rastreo?tracking=',
+  tcc:             'https://www.tcc.com.co/rastrear?guia=',
+  interrapidisimo: 'https://interrapidisimo.com/rastreo/?codigo=',
+  deprisa:         'https://www.deprisa.com/rastreo?guia=',
+  fedex:           'https://www.fedex.com/fedextrack/?tracknumbers=',
+  dhl:             'https://www.dhl.com/co-es/home/rastrear.html?tracking-id='
 };
 
-/* ══════════════════════════════════════════════
-   SCRAPERS POR EMPRESA
-══════════════════════════════════════════════ */
-
-/* ── Coordinadora ── */
-async function trackCoordinadora(guia) {
-  const url = `https://www.coordinadora.com/portafolio-de-servicios/servicios-en-linea/rastrear-guias/?guia=${encodeURIComponent(guia)}`;
-  const res = await fetchWithTimeout(url, { headers: HEADERS_BROWSER });
-  const html = await res.text();
-  const $ = cheerio.load(html);
-
-  const events = [];
-  /* La página de Coordinadora usa una tabla o lista de eventos */
-  $('table.table-tracking tr, .tracking-detail tr, .rastreo-detalle tr').each((i, row) => {
-    const cells = $(row).find('td');
-    if (cells.length >= 2) {
-      const fecha  = $(cells[0]).text().trim();
-      const estado = $(cells[1]).text().trim();
-      const ciudad = cells.length >= 3 ? $(cells[2]).text().trim() : '';
-      if (fecha || estado) events.push({ fecha, estado, ciudad });
-    }
-  });
-
-  /* Estado actual — primer resultado o texto de estado principal */
-  const estadoActual = $('.estado-guia, .tracking-status, .estado-actual, h3.status').first().text().trim()
-    || (events[0] ? events[0].estado : '');
-
-  return {
-    carrier: 'Coordinadora',
-    guia,
-    estadoActual: estadoActual || 'Sin información disponible',
-    eventos: events.slice(0, 10),
-    url,
-    rawFound: events.length > 0
-  };
-}
-
-/* ── Servientrega ── */
-async function trackServientrega(guia) {
-  /* Servientrega tiene una API JSON interna */
-  const url = `https://www.servientrega.com/wps/portal/tracking-masivo`;
-  const formData = `id=${encodeURIComponent(guia)}`;
-  const res = await fetchWithTimeout(url, {
-    method: 'POST',
-    headers: {
-      ...HEADERS_BROWSER,
-      'Content-Type': 'application/x-www-form-urlencoded',
-    },
-    body: formData
-  });
-  const html = await res.text();
-  const $ = cheerio.load(html);
-
-  const events = [];
-  $('.tracking-item, .timeline-item, table.tracking tr').each((i, el) => {
-    const fecha  = $(el).find('.date, td:nth-child(1)').text().trim();
-    const estado = $(el).find('.status, .description, td:nth-child(2)').text().trim();
-    const ciudad = $(el).find('.city, td:nth-child(3)').text().trim();
-    if (estado) events.push({ fecha, estado, ciudad });
-  });
-
-  const estadoActual = $('.current-status, .estado-principal, h2.status').first().text().trim()
-    || (events[0] ? events[0].estado : '');
-
-  return {
-    carrier: 'Servientrega',
-    guia,
-    estadoActual: estadoActual || 'Sin información disponible',
-    eventos: events.slice(0, 10),
-    url: `https://www.servientrega.com/wps/portal/tracking-masivo?id=${guia}`,
-    rawFound: events.length > 0
-  };
-}
-
-/* ── Envía ── */
-async function trackEnvia(guia) {
-  const url = `https://www.envia.co/rastreo?tracking=${encodeURIComponent(guia)}`;
-  const res = await fetchWithTimeout(url, { headers: HEADERS_BROWSER });
-  const html = await res.text();
-  const $ = cheerio.load(html);
-
-  const events = [];
-  $('.tracking-event, .timeline li, .rastreo-evento').each((i, el) => {
-    const fecha  = $(el).find('.date, .fecha, time').text().trim();
-    const estado = $(el).find('.description, .estado, p').first().text().trim();
-    const ciudad = $(el).find('.city, .ciudad').text().trim();
-    if (estado) events.push({ fecha, estado, ciudad });
-  });
-
-  const estadoActual = $('.tracking-status, .estado-actual, .current-status').first().text().trim()
-    || (events[0] ? events[0].estado : '');
-
-  return {
-    carrier: 'Envía',
-    guia,
-    estadoActual: estadoActual || 'Sin información disponible',
-    eventos: events.slice(0, 10),
-    url,
-    rawFound: events.length > 0
-  };
-}
-
-/* ── TCC ── */
-async function trackTCC(guia) {
-  const url = `https://www.tcc.com.co/rastrear?guia=${encodeURIComponent(guia)}`;
-  const res = await fetchWithTimeout(url, { headers: HEADERS_BROWSER });
-  const html = await res.text();
-  const $ = cheerio.load(html);
-
-  const events = [];
-  $('table tr, .tracking-row, .event-row').each((i, el) => {
-    const fecha  = $(el).find('td:nth-child(1), .date').text().trim();
-    const estado = $(el).find('td:nth-child(2), .status').text().trim();
-    const ciudad = $(el).find('td:nth-child(3), .city').text().trim();
-    if (estado && estado.length > 2) events.push({ fecha, estado, ciudad });
-  });
-
-  const estadoActual = $('.estado-actual, .current-status, h3').first().text().trim()
-    || (events[0] ? events[0].estado : '');
-
-  return {
-    carrier: 'TCC',
-    guia,
-    estadoActual: estadoActual || 'Sin información disponible',
-    eventos: events.slice(0, 10),
-    url,
-    rawFound: events.length > 0
-  };
-}
-
-/* ── Interrapídisimo ── */
-async function trackInterrapidisimo(guia) {
-  const url = `https://interrapidisimo.com/rastreo/?codigo=${encodeURIComponent(guia)}`;
-  const res = await fetchWithTimeout(url, { headers: HEADERS_BROWSER });
-  const html = await res.text();
-  const $ = cheerio.load(html);
-
-  const events = [];
-  $('.tracking-table tr, .rastreo tr, table.table tr').each((i, el) => {
-    const fecha  = $(el).find('td:nth-child(1)').text().trim();
-    const estado = $(el).find('td:nth-child(2)').text().trim();
-    const ciudad = $(el).find('td:nth-child(3)').text().trim();
-    if (estado && estado.length > 2) events.push({ fecha, estado, ciudad });
-  });
-
-  const estadoActual = events[0] ? events[0].estado : '';
-
-  return {
-    carrier: 'Interrapídisimo',
-    guia,
-    estadoActual: estadoActual || 'Sin información disponible',
-    eventos: events.slice(0, 10),
-    url,
-    rawFound: events.length > 0
-  };
-}
-
-/* ── Mapa de scrapers ── */
-const SCRAPERS = {
-  coordinadora:    trackCoordinadora,
-  servientrega:    trackServientrega,
-  envia:           trackEnvia,
-  tcc:             trackTCC,
-  interrapidisimo: trackInterrapidisimo
-};
-
-/* ══════════════════════════════════════════════
-   RUTAS
-══════════════════════════════════════════════ */
-
-/* Health check */
+/* ── Health check ── */
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', service: 'DistritoPhone Rastreo API', version: '1.0.0' });
+  res.json({ status: 'ok', service: 'DistritoPhone Rastreo API v2 (AfterShip)', version: '2.0.0' });
 });
 
-/* Rastreo principal */
+/* ── Rastreo principal ── */
 app.get('/track', async (req, res) => {
   const { carrier, guia } = req.query;
 
   if (!carrier || !guia) {
-    return res.status(400).json({ error: 'Parámetros requeridos: carrier, guia' });
+    return res.status(400).json({ ok: false, error: 'Parámetros requeridos: carrier, guia' });
   }
 
   const carrierId = carrier.toLowerCase().trim();
   const guiaClean = guia.trim();
+  const fallbackUrl = (FALLBACK_URLS[carrierId] || '') + encodeURIComponent(guiaClean);
 
-  if (!SCRAPERS[carrierId]) {
-    return res.status(400).json({
-      error: 'Empresa no soportada',
-      soportadas: Object.keys(SCRAPERS)
-    });
+  if (!AFTERSHIP_KEY) {
+    return res.status(500).json({ ok: false, error: 'API key no configurada', url: fallbackUrl });
+  }
+
+  const slug = CARRIER_SLUGS[carrierId];
+  if (!slug) {
+    return res.status(400).json({ ok: false, error: 'Empresa no soportada', url: fallbackUrl });
   }
 
   try {
-    const result = await SCRAPERS[carrierId](guiaClean);
-    return res.json({ ok: true, ...result });
+    /* Paso 1: crear/obtener tracking en AfterShip */
+    const createRes = await fetch('https://api.aftership.com/v4/trackings', {
+      method: 'POST',
+      headers: {
+        'aftership-api-key': AFTERSHIP_KEY,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        tracking: {
+          slug: slug,
+          tracking_number: guiaClean
+        }
+      })
+    });
+    const createData = await createRes.json();
+
+    /* 4001 = ya existe, también es válido */
+    let trackingData = null;
+    if (createData.meta && (createData.meta.code === 201 || createData.meta.code === 4001)) {
+      /* Paso 2: obtener detalles */
+      const getRes = await fetch(
+        `https://api.aftership.com/v4/trackings/${slug}/${encodeURIComponent(guiaClean)}`,
+        {
+          headers: { 'aftership-api-key': AFTERSHIP_KEY }
+        }
+      );
+      const getData = await getRes.json();
+      if (getData.data && getData.data.tracking) {
+        trackingData = getData.data.tracking;
+      }
+    } else if (createData.data && createData.data.tracking) {
+      trackingData = createData.data.tracking;
+    }
+
+    if (!trackingData) {
+      return res.json({
+        ok: true,
+        carrier: carrierId,
+        guia: guiaClean,
+        estadoActual: 'Sin información disponible',
+        eventos: [],
+        url: fallbackUrl,
+        rawFound: false
+      });
+    }
+
+    /* Mapear estado de AfterShip a español */
+    const statusMap = {
+      'Delivered':          'Entregado',
+      'InTransit':          'En tránsito',
+      'OutForDelivery':     'En reparto',
+      'AttemptFail':        'Intento fallido de entrega',
+      'Pending':            'Pendiente',
+      'InfoReceived':       'Información recibida',
+      'Exception':          'Novedad / Excepción',
+      'Expired':            'Guía vencida',
+      'AvailableForPickup': 'Disponible para recoger'
+    };
+
+    const estadoRaw = trackingData.tag || '';
+    const estadoActual = trackingData.subtag_message
+      || statusMap[estadoRaw]
+      || estadoRaw
+      || 'Sin información';
+
+    /* Convertir checkpoints a eventos */
+    const eventos = (trackingData.checkpoints || []).map(cp => ({
+      fecha:  cp.checkpoint_time ? new Date(cp.checkpoint_time).toLocaleString('es-CO') : '',
+      estado: cp.subtag_message || cp.message || cp.tag || '',
+      ciudad: [cp.city, cp.state, cp.country_name].filter(Boolean).join(', ')
+    })).filter(e => e.estado);
+
+    return res.json({
+      ok: true,
+      carrier: trackingData.slug || carrierId,
+      guia: guiaClean,
+      estadoActual,
+      destinatario: trackingData.customer_name || '',
+      origen: trackingData.origin_country_iso3 || '',
+      destino: trackingData.destination_country_iso3 || '',
+      eventos,
+      url: fallbackUrl,
+      rawFound: eventos.length > 0
+    });
+
   } catch (err) {
-    console.error(`[${carrierId}] Error rastreando ${guiaClean}:`, err.message);
+    console.error(`[${carrierId}] Error:`, err.message);
     return res.status(502).json({
       ok: false,
-      error: 'No se pudo obtener el estado. La empresa puede estar bloqueando el acceso.',
+      error: 'Error consultando el estado',
       carrier: carrierId,
       guia: guiaClean,
-      url: SCRAPERS[carrierId] ? `https://www.${carrierId}.com` : null
+      url: fallbackUrl
     });
   }
 });
 
-/* Lista de empresas soportadas */
+/* ── Lista de empresas ── */
 app.get('/carriers', (req, res) => {
-  res.json({
-    carriers: Object.keys(SCRAPERS).map(id => ({
-      id,
-      name: id.charAt(0).toUpperCase() + id.slice(1)
-    }))
-  });
+  res.json({ carriers: Object.keys(CARRIER_SLUGS) });
 });
 
 app.listen(PORT, () => {
-  console.log(`DistritoPhone Rastreo API corriendo en puerto ${PORT}`);
+  console.log(`DistritoPhone Rastreo API v2 corriendo en puerto ${PORT}`);
 });
