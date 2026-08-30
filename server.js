@@ -14,7 +14,7 @@ const fetch   = require('node-fetch');
 const cheerio = require('cheerio');
 
 const app  = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 
 /* ── CORS: permite llamadas desde GitHub Pages y localhost ── */
 const ALLOWED_ORIGINS = [
